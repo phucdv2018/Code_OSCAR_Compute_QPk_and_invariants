@@ -1,10 +1,11 @@
 # ==============================================================================
 # SPARSE GL-k INVARIANTS over GF(2)  —  Highest-weight-only global construction
 # Hit → (online elimination OR spill+merge) → admissible
-# Σk / GLk by weight-spaces with projection (precomputed (ρ_j−I) rows)
+# Σk / GLk by weight-spaces with projection
 # Stage 1: solve f ≡ γ·g + Σ β_i g'_i with (ρ_j−I)f≡0 for j=1..k−1 via kernel
 # Stage 2: solve (ρ_k−I) Σ λ_j Φ_j = 0 directly on kernel coordinates λ
 # Print h0 (from β_i=γ), the grouped g''_s, the candidate f, and VERIFY ρ_i for i=1..k
+# (This version: RAM-stable + auto-tune by N + lazy/precompute switch for (ρ_j-I).)
 # ==============================================================================
 
 using Distributed, Printf, Oscar, Random
@@ -61,6 +62,30 @@ function setup_logging(k::Int, d::Int)
     end)
 end
 
+# ---------- REAL-TIME tee printing to Jupyter (for Step 1 progress) ----------
+const __DUP_PROGRESS_TO_NOTEBOOK__ = Ref{Bool}(false)
+function init_progress_to_notebook!()
+    __DUP_PROGRESS_TO_NOTEBOOK__[] = isdefined(Main, :IJulia)
+end
+
+function tprintln(args...)
+    println(stdout, args...); flush(stdout)
+    if __DUP_PROGRESS_TO_NOTEBOOK__[] && __ORIG_STDOUT__[] !== nothing
+        println(__ORIG_STDOUT__[], args...); flush(__ORIG_STDOUT__[])
+    end
+end
+
+# Không dùng @printf với format string biến động: build s trước rồi in (tee).
+function tprintf(fmt::AbstractString, args...)
+    io_buf = IOBuffer()
+    Printf.format(io_buf, Printf.Format(fmt), args...)
+    s = String(take!(io_buf))
+    print(stdout, s); flush(stdout)
+    if __DUP_PROGRESS_TO_NOTEBOOK__[] && __ORIG_STDOUT__[] !== nothing
+        print(__ORIG_STDOUT__[], s); flush(__ORIG_STDOUT__[])
+    end
+end
+
 # ---------- Tunables ----------
 const DEFAULT_BATCH   = 256
 const MIN_BATCH       = 32
@@ -81,6 +106,12 @@ const HARD_MB = RAM_HARD_MB > 0 ? RAM_HARD_MB : max(12_288, (__RAM_TOTAL_MB__ * 
 approx_used_mb() = (GC.gc(false); try Base.gc_live_bytes() / 1024^2 catch; 0.0 end)
 
 @info "RAM thresholds (MB)" total=__RAM_TOTAL_MB__ soft=SOFT_MB hard=HARD_MB
+
+# ---------- Switches & caches (dynamic, RAM-safe) ----------
+# Auto-tuned after STEP 1:
+const PRECOMPUTE_RHO   = Ref(false)      # true for small jobs (fast), false for large (RAM-safe)
+const RHO_CACHE_MAX    = Ref(500_000)    # FIFO size for lazy (ρ_j−I) cache
+const REDUCE_CACHE_MAX = Ref(800_000)    # FIFO size for reduce cache
 
 # ---------- Types / helpers ----------
 const WeightKey = NTuple{N,Int} where N
@@ -149,12 +180,15 @@ end
     m
 end
 
+# --- Lucas mod-2 binomial test (overflow-free) ---
+@everywhere @inline binom_mod2(e::Int, i::Int) = ((i & ~e) == 0)
+
 @everywhere function steenrod_square_optimized(k_op::Int, mono, P, memo::IdDict{Any, Any})
     (iszero(mono) || k_op < 0) && return zero(P)
     k_op == 0 && return mono
     st = (k_op, mono)
     haskey(memo, st) && return memo[st]
-    isone(mono) && return (memo[st] = (k_op == 0 ? one(P) : zero(P)))
+    isone(mono) && return (k_op == 0 ? one(P) : zero(P))
     fidx = -1
     for i in 1:nvars(P)
         if degree(mono, i) > 0
@@ -166,7 +200,7 @@ end
     rest = divexact(mono, v^e)
     tot = zero(P)
     @inbounds for i in 0:k_op
-        isodd(binomial(e, i)) || continue
+        binom_mod2(e, i) || continue
         tot += v^(e + i) * steenrod_square_optimized(k_op - i, rest, P, memo)
     end
     memo[st] = tot
@@ -347,19 +381,28 @@ global __pivots__::Vector{Int}      = Int[]
 global __admissible_indices__::Vector{Int} = Int[]
 global __admissible_basis__::Vector = Vector{Any}()
 global __adpos__::Dict{Int,Int}     = Dict{Int,Int}()
-global __reduce_cache__::Dict{Int,Vector{Int}} = Dict{Int,Vector{Int}}()
-global __rho_rows_table__::Dict{Int, Vector{Vector{Int}}} = Dict{Int, Vector{Vector{Int}}}()
 
-# ---------- STEP 1: admissible (online elim default) ----------
+# Reduce cache (with FIFO cap)
+global __reduce_cache__::Dict{Int,Vector{Int}} = Dict{Int,Vector{Int}}()
+global __reduce_keys__::Vector{Int} = Int[]
+
+# (ρ_j−I) storage:
+# - if PRECOMPUTE_RHO[] == true → fill __rho_rows_table__
+# - else use lazy cache __rho_cache__ with FIFO
+global __rho_rows_table__::Dict{Int, Vector{Vector{Int}}} = Dict{Int, Vector{Vector{Int}}}()
+global __rho_cache__::Dict{Tuple{Int,Int}, Vector{Int}} = Dict{Tuple{Int,Int}, Vector{Int}}()
+global __rho_fifo__::Vector{Tuple{Int,Int}} = Tuple{Int,Int}[]
+
+# ---------- STEP 1: admissible (ONLINE ELIM) ----------
 function find_admissible_basis_streaming(degree::Int, k::Int, P)
-    @printf "--> Computing admissible basis (STREAM + ONLINE ELIM) for k=%d, d=%d\n" k degree
-    println("    - Generating & sorting monomials…")
+    tprintf("--> Computing admissible basis (STREAM + ONLINE ELIM) for k=%d, d=%d\n", k, degree)
+    tprintln("    - Generating & sorting monomials…")
     mono_time = @elapsed begin
         all_monos = collect(monomials_of_degree(P, degree))
         sort!(all_monos, lt = compare_monomials_optimized)
         global __all_monos_sorted__ = all_monos
     end
-    @printf "      %d monomials ready in %.1fs\n" length(__all_monos_sorted__) mono_time
+    tprintf("      %d monomials ready in %.1fs\n", length(__all_monos_sorted__), mono_time)
 
     mono_to_idx_exps = Dict{NTuple{k, Int}, Int}()
     for (i, m) in enumerate(__all_monos_sorted__)
@@ -373,7 +416,7 @@ function find_admissible_basis_streaming(degree::Int, k::Int, P)
         while (1 << p) <= degree
             k_op  = 1 << p; deg_g = degree - k_op
             if k_op > 0 && deg_g >= 0
-                @printf "      Processing Sq^%d…\n" k_op
+                tprintf("      Processing Sq^%d…\n", k_op)
                 gen_exps = exps_enum(k, deg_g); nG = length(gen_exps)
                 processed = 0; batch = DEFAULT_BATCH
                 while processed < nG
@@ -407,7 +450,8 @@ function find_admissible_basis_streaming(degree::Int, k::Int, P)
                     end
                     processed = hi
                     if processed % PRINT_EVERY == 0 || processed == nG
-                        @printf "        %d/%d generators, batch=%d, RAM≈%.1fMB, cols=%d, pivots=%d\n" processed nG batch approx_used_mb() total_cols length(pivotmap)
+                        tprintf("        %d/%d generators, batch=%d, RAM≈%.1fMB, cols=%d, pivots=%d\n",
+                                processed, nG, batch, approx_used_mb(), total_cols, length(pivotmap))
                     end
                 end
             end
@@ -417,7 +461,7 @@ function find_admissible_basis_streaming(degree::Int, k::Int, P)
 
     global __pivotmap__ = pivotmap
     global __pivots__   = sort!(collect(keys(pivotmap)))
-    @printf "    - Online elimination: %d cols in %.1fs ; pivots=%d\n" total_cols build_time length(__pivots__)
+    tprintf("    - Online elimination: %d cols in %.1fs ; pivots=%d\n", total_cols, build_time, length(__pivots__))
 
     num_monos = length(__all_monos_sorted__)
     admissible_indices = let S = Set(__pivots__)
@@ -427,12 +471,16 @@ function find_admissible_basis_streaming(degree::Int, k::Int, P)
     global __admissible_indices__ = admissible_indices
     global __admissible_basis__   = admissible_basis
     global __adpos__ = Dict{Int,Int}(admissible_indices[i] => i for i in 1:length(admissible_indices))
-    empty!(__reduce_cache__)
-    @printf "    - Final admissible basis: %d\n" length(admissible_basis)
+
+    # reset caches
+    empty!(__reduce_cache__); empty!(__reduce_keys__)
+    empty!(__rho_rows_table__); empty!(__rho_cache__); empty!(__rho_fifo__)
+
+    tprintf("    - Final admissible basis: %d\n", length(admissible_basis))
     admissible_basis
 end
 
-# ---------- Reduction helpers ----------
+# ---------- Reduction helpers (with FIFO cap) ----------
 function reduce_global_index_to_admissible_positions(idx::Int)::Vector{Int}
     cached = get(__reduce_cache__, idx, nothing)
     cached !== nothing && return cached
@@ -454,6 +502,14 @@ function reduce_global_index_to_admissible_positions(idx::Int)::Vector{Int}
     end
     sort!(rows)
     __reduce_cache__[idx] = rows
+    push!(__reduce_keys__, idx)
+    # FIFO eviction to cap memory
+    while length(__reduce_keys__) > REDUCE_CACHE_MAX[]
+        old = popfirst!(__reduce_keys__)
+        if old != idx && haskey(__reduce_cache__, old)
+            delete!(__reduce_cache__, old)
+        end
+    end
     rows
 end
 
@@ -487,7 +543,8 @@ end
 struct BitMat
     nrows::Int; ncols::Int; words_per_row::Int; data::Vector{UInt64}
 end
-BitMat(nrows::Int, ncols::Int) = BitMat(nrows, ncols, (ncols + 63) >>> 6, fill(0x00, nrows * ((ncols + 63) >>> 6)))
+BitMat(nrows::Int, ncols::Int) = BitMat(nrows, ncols, (ncols + 63) >>> 6,
+                                        fill(zero(UInt64), nrows * ((ncols + 63) >>> 6)))
 @inline _idx(bm::BitMat, r::Int, c::Int) = ((r - 1) * bm.words_per_row + (((c - 1) >>> 6) + 1), UInt64(1) << (UInt64(c - 1) & 0x3f))
 @inline function setbit!(bm::BitMat, r::Int, c::Int); pos, bit = _idx(bm, r, c); bm.data[pos] ⊻= bit; end
 @inline function getwordptr(bm::BitMat, r::Int); b = (r - 1) * bm.words_per_row + 1; view(bm.data, b:b + bm.words_per_row - 1) end
@@ -537,8 +594,13 @@ function nullspace_bit!(bm::BitMat)
     rank, basis
 end
 
-# ---------- Precompute (ρ_j - I) rows on admissible ----------
+# ---------- Precompute (ρ_j - I) rows on admissible (or skip if lazy) ----------
 function build_rho_rows_table!(admissible_basis::Vector, k_vars::Int, P)
+    if !PRECOMPUTE_RHO[]
+        @info "Skipping precompute of (rho_j - I); using lazy cache."
+        empty!(__rho_rows_table__); empty!(__rho_cache__); empty!(__rho_fifo__)
+        return
+    end
     @info "Precomputing (rho_j - I) rows on admissible basis for j=1..$k_vars"
     table = Dict{Int, Vector{Vector{Int}}}()
     N = length(admissible_basis)
@@ -553,6 +615,35 @@ function build_rho_rows_table!(admissible_basis::Vector, k_vars::Int, P)
         table[j] = cols
     end
     global __rho_rows_table__ = table
+end
+
+# ---------- Lazy (ρ_j - I) cache helpers ----------
+@inline function _rho_cache_push!(key::Tuple{Int,Int}, rows::Vector{Int})
+    __rho_cache__[key] = rows
+    push!(__rho_fifo__, key)
+    while length(__rho_fifo__) > RHO_CACHE_MAX[]
+        old = popfirst!(__rho_fifo__)
+        if old != key && haskey(__rho_cache__, old)
+            delete!(__rho_cache__, old)
+        end
+    end
+end
+
+function get_rho_rows(j::Int, cglob::Int, k_vars::Int, P)
+    if PRECOMPUTE_RHO[] && !isempty(__rho_rows_table__)
+        cols = get(__rho_rows_table__, j, nothing)
+        cols === nothing && return Int[]
+        return cols[cglob]
+    else
+        key = (j, cglob)
+        v = get(__rho_cache__, key, nothing)
+        v !== nothing && return v
+        b = __admissible_basis__[cglob]
+        p = apply_rho_optimized_poly(b, j, k_vars) + b
+        rows = reduce_poly_to_admissible_rows_cached(p, k_vars)
+        _rho_cache_push!(key, rows)
+        return rows
+    end
 end
 
 # ---------- Weight environment ----------
@@ -600,10 +691,9 @@ function sigma_on_weight(w::WeightKey, k_vars::Int, P, env::WeightEnv)
     BM = BitMat(length(gens) * Nw, Nw)
     row0 = 0
     for j in gens
-        col_rows_all = __rho_rows_table__[j]
         for lc in 1:Nw
             cglob = Widxs[lc]
-            rows = project_rows_to_weight(col_rows_all[cglob], idxset, localpos)
+            rows = project_rows_to_weight(get_rho_rows(j, cglob, k_vars, P), idxset, localpos)
             for r in rows; setbit!(BM, row0 + r, lc) end
         end
         row0 += Nw
@@ -628,14 +718,13 @@ function gl_on_weight_from_sigma(w::WeightKey, k_vars::Int, P, env::WeightEnv,
 
     r = length(kerS)
     BM = BitMat(Nw, r)   # only j=k (one block)
-    col_rows_k = __rho_rows_table__[k_vars]
     for csmall in 1:r
         rows = Int[]
         v = kerS[csmall]
         for i in 1:Nw
             v[i] || continue
             cglob = Widxs[i]
-            rr = project_rows_to_weight(col_rows_k[cglob], idxset, localpos)
+            rr = project_rows_to_weight(get_rho_rows(k_vars, cglob, k_vars, P), idxset, localpos)
             xor_sorted!(rows, rr)
         end
         for r1 in rows; setbit!(BM, r1, csmall) end
@@ -684,7 +773,7 @@ function print_invariants_labeled(kind::Symbol, k::Int, polys::Vector)
     end
 end
 
-# ---------- NEW: print full bases of weight spaces (explicit) ----------
+# ---------- NEW: print full bases of weight spaces (explicit, no cap) ----------
 function print_weight_bases(k::Int, env::WeightEnv)
     println("\n" * "="^80)
     @printf "WEIGHT-SPACE BASES (k=%d)\n" k
@@ -692,10 +781,9 @@ function print_weight_bases(k::Int, env::WeightEnv)
     for w in env.sorted_keys
         members = env.w2idxs[w]
         @printf "\n* Weight w=%s  |  dim = %d\n" string(w) length(members)
-        # list in lexicographic (dictionary) order of the monomial strings
         mons = __admissible_basis__[members]
         strs = sort!(string.(mons))
-        # print in two columns, with local numbering [1], [2], ...
+        # two columns, numbered locally [1], [2], ...
         usable = max(20, WRAP_WIDTH - 6); gap = 4; colw = max(10, (usable - gap) ÷ 2)
         i = 1
         while i <= length(strs)
@@ -751,7 +839,7 @@ function stage1_kernel(k_vars::Int, P, g_poly, lower_cols_idx::Vector{Int})
     # Columns for each lower monomial g'_t
     for (t, cglob) in enumerate(lower_cols_idx)
         for j in 1:k_vars-1
-            rr = __rho_rows_table__[j][cglob]
+            rr = get_rho_rows(j, cglob, k_vars, P)
             off = (j - 1) * N
             for r1 in rr; setbit!(BM, off + r1, 1 + t) end
         end
@@ -761,7 +849,7 @@ function stage1_kernel(k_vars::Int, P, g_poly, lower_cols_idx::Vector{Int})
     return ((k_vars - 1) * N, 1 + m, rk, ker)
 end
 
-# Polynomial basis for the Stage 1 kernel: φ_j = (γ_j ? g : 0) + Σ (β_{j,t} ? g'_t : 0)
+
 function build_kernel_phi_basis(P, g_poly, lower_cols_idx::Vector{Int}, ker::Vector{BitVector})
     r = length(ker)
     phi = Vector{Any}(undef, r)
@@ -803,22 +891,59 @@ function verify_global_GL_invariance!(p, k_vars::Int)
     bad
 end
 
+# ---------- Auto-tune after STEP 1 ----------
+function auto_tune_after_step1!(k_vars::Int)
+    N = length(__admissible_basis__)
+    mem_margin = max(0.0, SOFT_MB - approx_used_mb())  # MB until SOFT
+
+    # Decide precompute vs lazy: small N + ≥3GB headroom → precompute for speed
+    PRECOMPUTE_RHO[] = (N <= 40_000 && mem_margin >= 3000)
+
+    # Retune cache sizes
+    if N <= 30_000
+        RHO_CACHE_MAX[]    = 300_000
+        REDUCE_CACHE_MAX[] = 800_000
+    elseif N <= 80_000
+        RHO_CACHE_MAX[]    = 500_000
+        REDUCE_CACHE_MAX[] = 1_200_000
+    elseif N <= 150_000
+        RHO_CACHE_MAX[]    = 700_000
+        REDUCE_CACHE_MAX[] = 1_600_000
+    else
+        RHO_CACHE_MAX[]    = 900_000
+        REDUCE_CACHE_MAX[] = 2_000_000
+    end
+
+    # Optional env override (power users):
+    if haskey(ENV, "FORCE_PRECOMPUTE_RHO")
+        PRECOMPUTE_RHO[] = lowercase(ENV["FORCE_PRECOMPUTE_RHO"]) in ("1","true","yes")
+    end
+
+    @info "Auto-tune" N=N k=k_vars precompute=PRECOMPUTE_RHO[] RHO_CACHE_MAX=RHO_CACHE_MAX[] REDUCE_CACHE_MAX=REDUCE_CACHE_MAX[] mem_margin_MB=round(mem_margin; digits=1)
+end
+
 # ---------- MAIN (highest-weight-only) ----------
 function ultra_sparse_bitpacked_main(k_vars::Int, degree::Int; spill_dir::Union{String,Nothing}=nothing)
     spill_dir = isnothing(spill_dir) ? get(ENV, "SPILL_DIR_DEFAULT", "hit_spill") : spill_dir
 
     setup_logging(k_vars, degree)
+    init_progress_to_notebook!()   # <-- enable tee to notebook if in IJulia
+
     tot = @elapsed begin
-        println("="^80)
-        @printf "SPARSE-HIT + ONLINE-ELIM + Σ_k/GL_k by WEIGHTS (k=%d, d=%d) | procs=%d, threads=%d\n" k_vars degree nprocs() Threads.nthreads()
-        println("="^80)
+        tprintln("="^80)
+        tprintf("SPARSE-HIT + ONLINE-ELIM + Σ_k/GL_k by WEIGHTS (k=%d, d=%d) | procs=%d, threads=%d\n",
+                k_vars, degree, nprocs(), Threads.nthreads())
+        tprintln("="^80)
         P, _ = polynomial_ring(GF(2), ["x$i" for i in 1:k_vars])
         try
             # ---- STEP 1: Admissible ----
-            println("\n--> STEP 1: Admissible basis")
+            tprintln("\n--> STEP 1: Admissible basis")
             find_admissible_basis_streaming(degree, k_vars, P)
 
-            # ---- PRECOMPUTE rows of (ρ_j−I) on admissible ----
+            # ---- Auto-tune (decide precompute vs lazy + cache sizes) ----
+            auto_tune_after_step1!(k_vars)
+
+            # ---- PRECOMPUTE rows of (ρ_j−I) on admissible (or skip) ----
             build_rho_rows_table!(__admissible_basis__, k_vars, P)
 
             # ---- WEIGHT ENV + SUMMARY ----
@@ -829,7 +954,7 @@ function ultra_sparse_bitpacked_main(k_vars::Int, degree::Int; spill_dir::Union{
             end
             println()
 
-            # ---- NEW: print explicit bases for each weight (right below summary) ----
+            # ---- Print explicit bases for each weight (full) ----
             print_weight_bases(k_vars, env)
 
             # ---- Compute Σ/GL per weight + print details ----
@@ -923,7 +1048,7 @@ function ultra_sparse_bitpacked_main(k_vars::Int, degree::Int; spill_dir::Union{
                 else
                     h0_view = zero(P)
                     for t in eq_gamma_t; h0_view += __admissible_basis__[lower_cols_idx[t]]; end
-                    println("\n[h0] group (β_i = γ) — members t = {", join(eq_gamma_t, ", "), "}")
+                    println("\n[h0] group (β_i = γ) — members t = {", join(string.(eq_gamma_t), ", "), "}")
                     println("h0 ="); println(poly_to_string_wrapped(h0_view))
                 end
 
@@ -932,7 +1057,7 @@ function ultra_sparse_bitpacked_main(k_vars::Int, degree::Int; spill_dir::Union{
                     println("  (none)")
                 else
                     for s in 1:length(groups_tsets)
-                        println(@sprintf("  g''[%d] members t={%s}", s, join(groups_tsets[s], ", ")))
+                        println(@sprintf("  g''[%d] members t={%s}", s, join(string.(groups_tsets[s]), ", ")))
                         println(poly_to_string_wrapped(groups_polys[s]))
                     end
                 end
@@ -988,7 +1113,7 @@ function ultra_sparse_bitpacked_main(k_vars::Int, degree::Int; spill_dir::Union{
                     if isempty(δ_on)
                         println("  all δ_s = 0")
                     else
-                        println(@sprintf("  δ_s = 1 at s ∈ {%s}", join(δ_on, ", ")))
+                        println(@sprintf("  δ_s = 1 at s ∈ {%s}", join(string.(δ_on), ", ")))
                     end
 
                     println("\n[h0 from this solution] =")
@@ -1024,5 +1149,5 @@ function ultra_sparse_bitpacked_main(k_vars::Int, degree::Int; spill_dir::Union{
 end
 
 # -------- RUN (example) --------
-ultra_sparse_bitpacked_main(6, 17)
+ultra_sparse_bitpacked_main(5, 23)
 
