@@ -1149,5 +1149,5 @@ function ultra_sparse_bitpacked_main(k_vars::Int, degree::Int; spill_dir::Union{
 end
 
 # -------- RUN (example) --------
-ultra_sparse_bitpacked_main(5, 23)
+ultra_sparse_bitpacked_main(6, 17)
 
